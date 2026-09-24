@@ -1,0 +1,26 @@
+# Binaries
+zap_tui
+*.exe
+*.test
+
+# SQLite local databases and WAL files
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+session.db*
+zap_session.db*
+
+# Log files
+*.log
+
+# Environment and sensitive keys
+.env
+.env.*
+
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/
