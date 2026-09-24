@@ -11,6 +11,7 @@ import (
 
 	_ "modernc.org/sqlite"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -156,6 +157,26 @@ func (c *Client) handleEvent(rawEvt any) {
 		// Sincronizar contatos e grupos iniciais em background
 		go c.syncInitialData()
 
+	case *events.PushName:
+		if evt.NewPushName != "" {
+			_, _, _ = c.cli.Store.Contacts.PutPushName(context.Background(), evt.JID, evt.NewPushName)
+			_ = c.store.UpdateChatName(evt.JID.String(), evt.NewPushName)
+			c.dispatch(MsgContactUpdated{JID: evt.JID.String(), Name: evt.NewPushName})
+		}
+
+	case *events.Contact:
+		if evt.Action != nil {
+			name := evt.Action.GetFullName()
+			if name == "" {
+				name = evt.Action.GetFirstName()
+			}
+			if name != "" {
+				_ = c.cli.Store.Contacts.PutContactName(context.Background(), evt.JID, name, evt.Action.GetFirstName())
+				_ = c.store.UpdateChatName(evt.JID.String(), name)
+				c.dispatch(MsgContactUpdated{JID: evt.JID.String(), Name: name})
+			}
+		}
+
 	case *events.Disconnected:
 		c.mu.Lock()
 		c.connected = false
@@ -178,8 +199,17 @@ func (c *Client) handleEvent(rawEvt any) {
 
 // syncInitialData carrega contatos e grupos salvos e emite a lista para a TUI
 func (c *Client) syncInitialData() {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+
+	// Inicia a sincronização de patches de AppState (onde a agenda e contatos são sincronizados)
+	go func() {
+		ctxSync, cancelSync := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancelSync()
+		for _, patch := range appstate.AllPatchNames {
+			_ = c.cli.FetchAppState(ctxSync, patch, false, false)
+		}
+	}()
 
 	var chatsBatch []*db.Chat
 
@@ -202,7 +232,13 @@ func (c *Client) syncInitialData() {
 		for jid, info := range contacts {
 			name := info.FullName
 			if name == "" {
+				name = info.BusinessName
+			}
+			if name == "" {
 				name = info.PushName
+			}
+			if name == "" {
+				name = info.FirstName
 			}
 			if name == "" {
 				name = jid.User
@@ -233,6 +269,43 @@ func (c *Client) handleHistorySync(sync *waHistorySync.HistorySync) {
 		return
 	}
 
+	// 1. Processar nomes da agenda de contatos sincronizados pelo celular
+	for _, ic := range sync.GetInlineContacts() {
+		pnJIDStr := ic.GetPnJID()
+		if pnJIDStr == "" {
+			continue
+		}
+		jid, err := types.ParseJID(pnJIDStr)
+		if err != nil {
+			continue
+		}
+		name := ic.GetFullName()
+		if name == "" {
+			name = ic.GetFirstName()
+		}
+		if name != "" {
+			_ = c.cli.Store.Contacts.PutContactName(context.Background(), jid, name, ic.GetFirstName())
+			_ = c.store.UpdateChatName(jid.String(), name)
+			c.dispatch(MsgContactUpdated{JID: jid.String(), Name: name})
+		}
+	}
+
+	// 2. Processar nomes de perfil (Pushnames) recebidos
+	for _, pn := range sync.GetPushnames() {
+		idStr := pn.GetID()
+		pushName := pn.GetPushname()
+		if idStr == "" || pushName == "" {
+			continue
+		}
+		jid, err := types.ParseJID(idStr)
+		if err != nil {
+			continue
+		}
+		_, _, _ = c.cli.Store.Contacts.PutPushName(context.Background(), jid, pushName)
+		_ = c.store.UpdateChatName(jid.String(), pushName)
+		c.dispatch(MsgContactUpdated{JID: jid.String(), Name: pushName})
+	}
+
 	var msgsBatch []*db.Message
 	var chatsBatch []*db.Chat
 
@@ -245,7 +318,7 @@ func (c *Client) handleHistorySync(sync *waHistorySync.HistorySync) {
 
 		chatName := conv.GetName()
 		if chatName == "" {
-			chatName = chatJID.User
+			chatName = c.ResolveContactName(chatJID)
 		}
 
 		var lastMsgText string
@@ -275,7 +348,7 @@ func (c *Client) handleHistorySync(sync *waHistorySync.HistorySync) {
 
 			senderName := evtMsg.Info.PushName
 			if senderName == "" {
-				senderName = evtMsg.Info.Sender.User
+				senderName = c.ResolveContactName(evtMsg.Info.Sender)
 			}
 			if evtMsg.Info.IsFromMe {
 				senderName = "Você"
@@ -332,8 +405,14 @@ func (c *Client) handleIncomingMessage(evt *events.Message) {
 	senderJID := evt.Info.Sender.String()
 
 	senderName := evt.Info.PushName
-	if senderName == "" {
-		senderName = evt.Info.Sender.User
+	if senderName != "" {
+		_, _, _ = c.cli.Store.Contacts.PutPushName(context.Background(), evt.Info.Sender, senderName)
+		if !evt.Info.IsGroup && !evt.Info.IsFromMe {
+			_ = c.store.UpdateChatName(chatJID, senderName)
+			c.dispatch(MsgContactUpdated{JID: chatJID, Name: senderName})
+		}
+	} else {
+		senderName = c.ResolveContactName(evt.Info.Sender)
 	}
 	if evt.Info.IsFromMe {
 		senderName = "Você"
@@ -475,4 +554,40 @@ func extractText(msg *waE2E.Message) string {
 		return "👤 [Contato: " + contact.GetDisplayName() + "]"
 	}
 	return ""
+}
+
+// ResolveContactName obtém o melhor nome para um contato (Agenda > Business > PushName > Primeiro Nome > Telefone)
+func (c *Client) ResolveContactName(jid types.JID) string {
+	if jid.Server == types.GroupServer {
+		return jid.User
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if c.cli != nil && c.cli.Store != nil && c.cli.Store.Contacts != nil {
+		contact, err := c.cli.Store.Contacts.GetContact(ctx, jid)
+		if err == nil && contact.Found {
+			if contact.FullName != "" {
+				return contact.FullName
+			}
+			if contact.BusinessName != "" {
+				return contact.BusinessName
+			}
+			if contact.PushName != "" {
+				return contact.PushName
+			}
+			if contact.FirstName != "" {
+				return contact.FirstName
+			}
+		}
+	}
+
+	if c.store != nil {
+		chat, err := c.store.GetChat(jid.String())
+		if err == nil && chat != nil && chat.Name != "" && chat.Name != jid.User {
+			return chat.Name
+		}
+	}
+
+	return jid.User
 }

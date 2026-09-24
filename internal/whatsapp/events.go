@@ -42,3 +42,9 @@ type MsgChatsLoaded struct {
 type MsgError struct {
 	Err error
 }
+
+// MsgContactUpdated é despachado quando o nome de um contato é descoberto ou atualizado
+type MsgContactUpdated struct {
+	JID  string
+	Name string
+}

@@ -160,6 +160,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case whatsapp.MsgNewMessage:
 		m.handleIncomingMessage(msg.Message)
 
+	case whatsapp.MsgContactUpdated:
+		for _, c := range m.chats {
+			if c.JID == msg.JID {
+				c.Name = msg.Name
+				break
+			}
+		}
+		if m.activeChat != nil && m.activeChat.JID == msg.JID {
+			m.activeChat.Name = msg.Name
+		}
+
 	case MsgSendResult:
 		if msg.Err != nil {
 			m.status = fmt.Sprintf("Erro ao enviar: %v", msg.Err)
@@ -478,6 +489,28 @@ func (m *Model) handleInputSubmit(inputVal string) tea.Cmd {
 		m.chats = append([]*db.Chat{newChat}, m.chats...)
 		m.selectedChatIdx = 0
 		return m.selectChat(0, true)
+	}
+
+	if strings.HasPrefix(inputVal, "/name ") || strings.HasPrefix(inputVal, "/rename ") {
+		newName := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(inputVal, "/name "), "/rename "))
+		if newName == "" {
+			m.status = "Uso: /name <novo nome>"
+			return nil
+		}
+		if m.activeChat == nil {
+			m.status = "Nenhuma conversa selecionada para renomear"
+			return nil
+		}
+		_ = m.store.UpdateChatName(m.activeChat.JID, newName)
+		m.activeChat.Name = newName
+		for _, c := range m.chats {
+			if c.JID == m.activeChat.JID {
+				c.Name = newName
+				break
+			}
+		}
+		m.status = "Contato renomeado para: " + newName
+		return nil
 	}
 
 	if m.activeChat == nil {

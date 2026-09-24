@@ -254,6 +254,29 @@ func (s *Store) GetMessages(chatJID string, limit int) ([]*Message, error) {
 	return messages, nil
 }
 
+// UpdateChatName atualiza o nome de exibição de um contato/chat
+func (s *Store) UpdateChatName(chatJID string, name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`UPDATE local_chats SET name = ? WHERE jid = ?`, name, chatJID)
+	return err
+}
+
+// GetChat recupera os dados de uma conversa específica pelo JID
+func (s *Store) GetChat(chatJID string) (*Chat, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var c Chat
+	query := `SELECT jid, name, COALESCE(last_message, ''), last_message_time, is_group, unread_count FROM local_chats WHERE jid = ?`
+	err := s.db.QueryRow(query, chatJID).Scan(&c.JID, &c.Name, &c.LastMessage, &c.LastMessageTime, &c.IsGroup, &c.UnreadCount)
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
 // Close fecha a conexão com o banco SQLite
 func (s *Store) Close() error {
 	s.mu.Lock()
